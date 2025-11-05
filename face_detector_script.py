@@ -157,39 +157,149 @@ def run_on_webcam(model_path: str, cam_index: int = 0) -> None:
     cap.release()
     cv2.destroyAllWindows()
 
+def run_on_video(model_path: str, video_path: str, save: Optional[str] = None) -> None:
+    """Detect faces on a video file"""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video: {video_path}")
+
+    # FPS for timestamps; fallback to 30 if unknown
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps != fps or fps < 1:
+        fps = 30.0
+    ms_per_frame = int(round(1000.0 / fps))
+
+    # Base frame size (for preview scaling & writer)
+    in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Preview size (downscale if needed)
+    preview_max_w = globals().get("PREVIEW_MAX_WIDTH", 1280)
+    preview_max_h = globals().get("PREVIEW_MAX_HEIGHT", 720)
+    scale = min(preview_max_w / max(in_w, 1), preview_max_h / max(in_h, 1), 1.0)
+    preview_w = max(1, int(in_w * scale))
+    preview_h = max(1, int(in_h * scale))
+
+    # Optional writer for annotated output (full-res)
+    writer = None
+    if save:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(save, fourcc, fps, (in_w, in_h))
+        if not writer.isOpened():
+            writer.release()
+            writer = None
+            print(f"[warn] Failed to open VideoWriter for {save}. Continuing without saving.")
+
+    options = FaceDetectorOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=RunningMode.VIDEO
+    )
+    frame_idx = 0
+    with FaceDetector.create_from_options(options) as detector:
+        print("[video] Press 'q' to quit.")
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+
+            ts_ms = frame_idx * ms_per_frame
+            frame_idx += 1
+
+            result = detector.detect_for_video(mp_image, ts_ms)
+
+            # Draw detections on full-res frame
+            draw_detections_bgr(frame_bgr, result)
+
+            # Write annotated frame if requested
+            if writer is not None:
+                writer.write(frame_bgr)
+
+            # Show downscaled preview only
+            if scale < 1.0:
+                preview = cv2.resize(frame_bgr, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+            else:
+                preview = frame_bgr
+
+            cv2.imshow("Face Detection (video)", preview)
+            if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
+                break
+
+    cap.release()
+    if writer is not None:
+        writer.release()
+        print(f"[video] Saved annotated video: {save}")
+    cv2.destroyAllWindows()
+
+
 
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 def parse_args():
-    ap = argparse.ArgumentParser(description="MediaPipe Face Detector — Image or Webcam")
-    ap.add_argument("--model", type=str, default="detector.tflite",
-                    help="Path to .tflite face detector model (auto-download if missing)")
-    ap.add_argument("--image", type=str, default=None,
-                    help="Path to an input image. If set, runs image mode.")
-    ap.add_argument("--webcam", type=int, default=None,
-                    help="Webcam index (e.g., 0). If set, runs webcam mode.")
-    ap.add_argument("--save", type=str, default=None,
-                    help="Output path for annotated image (image mode only).")
+    ap = argparse.ArgumentParser(
+        description="MediaPipe Face Detector — Image, Video, or Webcam")
+    ap.add_argument(
+        "--model", type=str, default="detector.tflite",
+        help="Path to .tflite face detector model (auto-download if missing)")
+    ap.add_argument(
+        "--image", type=str, default=None,
+        help="Path to an input image. If set, runs image mode.")
+    ap.add_argument(
+        "--video", type=str, default=None,
+        help="Path to an input video file. If set, runs video mode.")
+    ap.add_argument(
+        "--webcam", type=int, default=None,
+        help="Webcam index (e.g., 0). If set, runs webcam mode.")
+    ap.add_argument(
+        "--save", type=str, default=None,
+        help="Output path for annotated media (image or video mode). "
+             "If omitted: image → <name>_faces.jpg, video → <name>_faces.mp4")
     return ap.parse_args()
+
 
 def main():
     args = parse_args()
+
+    # Enforce exactly one mode
+    modes_selected = sum(x is not None for x in (args.image, args.video, args.webcam))
+    if modes_selected != 1:
+        print("Please choose exactly one mode: --image <path> OR --video <path> OR --webcam <index>.")
+        print("Examples:")
+        print("  python face_detector_webcam.py --image path/to/pic.jpg")
+        print("  python face_detector_webcam.py --video path/to/clip.mp4 --save out_faces.mp4")
+        print("  python face_detector_webcam.py --webcam 0")
+        return
+
     model_path = ensure_model(args.model)
 
-    if args.image and args.webcam is not None:
-        print("Choose either --image or --webcam, not both.")
-        return
-    if args.image:
+    if args.image is not None:
         if not os.path.exists(args.image):
             raise FileNotFoundError(args.image)
-        out_path = args.save or os.path.splitext(args.image)[0] + "_faces.jpg"
+        # Default save path for image
+        if args.save:
+            out_path = args.save
+        else:
+            stem, ext = os.path.splitext(args.image)
+            out_path = f"{stem}_faces.jpg"
         run_on_image(model_path, args.image, show=True, save=out_path)
-    elif args.webcam is not None:
+
+    elif args.video is not None:
+        if not os.path.exists(args.video):
+            raise FileNotFoundError(args.video)
+        # Default save path for video
+        if args.save:
+            out_path = args.save
+        else:
+            stem, _ = os.path.splitext(args.video)
+            out_path = f"{stem}_faces.mp4"
+        run_on_video(model_path, args.video, save=out_path)
+
+    else:  # webcam mode
         run_on_webcam(model_path, args.webcam)
-    else:
-        print("Nothing to do. Provide --image <path> or --webcam <index>.")
-        print("Example: python face_detector_webcam.py --webcam 0")
+
 
 if __name__ == "__main__":
     main()
